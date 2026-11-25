@@ -52,7 +52,13 @@ python3 tests/walkthrough.py http://127.0.0.1:8000
 - **同源合并**：正文按「来源集合相同」切成极大连续段存储，连续同源的字只占一份来源集合，
   来源集合内容寻址、跨版共享；未改字即使正文位置移动也不复制来源记录，只在 `body_span`
   里记一个 `map_start` 让查源仍能精确回指框内位置。
+- **大稿不受 SQLite 参数上限影响**：任何 SQL 语句绑定的参数个数都不随正文段数、
+  来源集合数或集合内条目数增长。稿件页的悬停预览是一条固定两条参数的窗口查询，
+  每个来源集合最多取 9 条（显示前 8 条，超出补「…」）；按版/区间查源照常返回完整明细；
+  写入来源集合用逐行 `executemany`；全量条目加载按连接的
+  `SQLITE_LIMIT_VARIABLE_NUMBER` 分块。旧库（含超大的来源并集）无需迁移即可打开、校订。
 - **发版**：正文与来源在同一 SQLite 事务内写入一个新 `release`；旧版是完整快照，读取不需要重放校订。
+  任一步失败则整个事务回滚，现行版指针与历史版保持不变，服务继续提供原版。
 - **只接受现行版**：提交必须带 `base_release_id`；若写事务开启时它已不是现行版，返回 409，
   事务回滚，`current_release_id` 与所有表都不变。
 
@@ -84,9 +90,15 @@ python3 tests/walkthrough.py http://127.0.0.1:8000
 ## 测试
 
 ```bash
-python3 -m unittest discover -s tests        # 41 个用例：领域逻辑、HTTP、并发过期、码点
+python3 -m unittest discover -s tests        # 55 个用例：领域逻辑、HTTP、并发过期、码点、大稿参数上限
 python3 tests/walkthrough.py http://...      # 对真实服务走表单流程
+python3 tests/big_manuscript.py http://... 600
+                                             # 大稿：跨数百识别框导入/校订/查源/历史版
 python3 tests/concurrency.py http://...      # 并发提交/重复导入竞态
 node tests/selection_test.js /tmp/page.html ocr_archive/static/app.js
                                              # 浏览器选区→码点映射（需先跑 tests/render_for_js.py）
 ```
+
+`tests/big_manuscript.py` 的第二个参数是识别框数量（默认 600，可试 5000）。
+它在运行中的服务上演示：打开大稿稿件页、一次选中断面覆盖全部识别框并提交校订、
+查源返回全部框明细、悬停只显示前 8 条加省略号、历史版仍可原样查阅。

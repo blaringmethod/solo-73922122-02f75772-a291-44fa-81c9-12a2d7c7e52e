@@ -12,6 +12,18 @@ from flask import current_app, g
 
 SCHEMA_PATH = Path(__file__).with_name("schema.sql")
 
+# The body-pane hover preview shows at most this many source entries per
+# provenance set. One extra row is fetched so we know whether to append "…".
+PREVIEW_SOURCE_LIMIT = 9
+PREVIEW_SOURCE_TITLES = 8
+
+# SQLite builds differ widely in SQLITE_LIMIT_VARIABLE_NUMBER (999 on some
+# platforms, 32766 or 250000 on others). Queries in this module never bind one
+# parameter per span or per source set; this cap is only used to size the
+# defensive chunking of the full-detail loader.
+_DEFAULT_VARIABLE_LIMIT = 999
+_MAX_CHUNK_PARAMS = 900
+
 
 class ArchiveError(Exception):
     """Base class for domain errors that should be shown to the user."""
@@ -288,28 +300,99 @@ def load_spans(conn: sqlite3.Connection, release_id: int) -> list[Span]:
     ]
 
 
+def _variable_limit(conn: sqlite3.Connection) -> int:
+    """How many bound parameters one statement may carry on this connection."""
+    getlimit = getattr(conn, "getlimit", None)
+    if getlimit is not None:
+        try:
+            value = int(getlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER))
+            if value > 0:
+                return value
+        except (AttributeError, ValueError, sqlite3.Error):
+            pass
+    return _DEFAULT_VARIABLE_LIMIT
+
+
 def load_source_entries(
     conn: sqlite3.Connection, source_set_ids: Iterable[int]
 ) -> dict[int, tuple[SourceEntry, ...]]:
+    """Load every source entry for the given sets.
+
+    The ids are split into chunks sized from the connection's actual
+    SQLITE_LIMIT_VARIABLE_NUMBER, so neither the number of spans in a release
+    nor the number of sets selected can exceed one statement's parameter limit.
+    Full detail queries intentionally use this loader; the hover preview has
+    its own bounded query.
+    """
     ids = sorted(set(source_set_ids))
     result: dict[int, list[SourceEntry]] = {i: [] for i in ids}
     if not ids:
         return {}
-    placeholders = ",".join("?" for _ in ids)
+    chunk_size = max(1, min(_MAX_CHUNK_PARAMS, _variable_limit(conn) - 10))
+    for offset in range(0, len(ids), chunk_size):
+        chunk = ids[offset : offset + chunk_size]
+        placeholders = ",".join("?" for _ in chunk)
+        rows = conn.execute(
+            "SELECT source_set_id, box_id, box_start, box_end FROM source_entry "
+            f"WHERE source_set_id IN ({placeholders}) "
+            "ORDER BY source_set_id, box_id, box_start, box_end",
+            chunk,
+        ).fetchall()
+        for row in rows:
+            result[row["source_set_id"]].append(
+                SourceEntry(row["box_id"], row["box_start"], row["box_end"])
+            )
+    return {k: tuple(v) for k, v in result.items()}
+
+
+@dataclass(frozen=True)
+class SourcePreview:
+    page_no: int
+    box_no: int
+    box_start: int
+    box_end: int
+
+
+def load_source_previews(
+    conn: sqlite3.Connection,
+    release_id: int,
+    limit: int = PREVIEW_SOURCE_LIMIT,
+) -> dict[int, tuple[SourcePreview, ...]]:
+    """At most `limit` entries per source set used by one release.
+
+    This is the query behind the body-pane hover text. It binds two parameters
+    no matter how many spans, source sets or entries the release has, and
+    SQLite (not Python) applies the per-set cap. Fetching 9 when 8 are shown
+    tells us whether an ellipsis is needed.
+    """
     rows = conn.execute(
-        "SELECT source_set_id, box_id, box_start, box_end FROM source_entry "
-        f"WHERE source_set_id IN ({placeholders}) "
-        "ORDER BY source_set_id, box_id, box_start, box_end",
-        ids,
+        "SELECT source_set_id, page_no, box_no, box_start, box_end, rn FROM ("
+        "  SELECT se.source_set_id AS source_set_id, "
+        "         b.page_no AS page_no, b.box_no AS box_no, "
+        "         se.box_start AS box_start, se.box_end AS box_end, "
+        "         ROW_NUMBER() OVER ("
+        "           PARTITION BY se.source_set_id "
+        "           ORDER BY se.box_id, se.box_start, se.box_end"
+        "         ) AS rn "
+        "  FROM source_entry se JOIN box b ON b.id = se.box_id "
+        "  WHERE se.source_set_id IN ("
+        "    SELECT source_set_id FROM body_span WHERE release_id = ?"
+        "  )"
+        ") WHERE rn <= ? "
+        "ORDER BY source_set_id, rn",
+        (release_id, limit),
     ).fetchall()
+    result: dict[int, list[SourcePreview]] = {}
     for row in rows:
-        result[row["source_set_id"]].append(
-            SourceEntry(row["box_id"], row["box_start"], row["box_end"])
+        result.setdefault(row["source_set_id"], []).append(
+            SourcePreview(
+                row["page_no"], row["box_no"], row["box_start"], row["box_end"]
+            )
         )
     return {k: tuple(v) for k, v in result.items()}
 
 
-def _source_set_key(entries: Sequence[SourceEntry]) -> str:
+def _source_set_key(entries: Iterable[SourceEntry]) -> str:
     canonical = sorted({(e.box_id, e.box_start, e.box_end) for e in entries})
     return json.dumps(canonical, separators=(",", ":"))
 
@@ -322,12 +405,14 @@ def get_or_create_source_set(
     )
     if not canonical:
         raise ValidationError("来源集合不能为空")
-    key = json.dumps(canonical, separators=(",", ":"))
+    key = _source_set_key(entries)
     row = conn.execute("SELECT id FROM source_set WHERE key = ?", (key,)).fetchone()
     if row is not None:
         return int(row["id"])
     cur = conn.execute("INSERT INTO source_set (key) VALUES (?)", (key,))
     set_id = int(cur.lastrowid)
+    # executemany binds one row's four values per statement, so an arbitrarily
+    # large inherited union is written without a single oversized statement.
     conn.executemany(
         "INSERT INTO source_entry (source_set_id, box_id, box_start, box_end) "
         "VALUES (?, ?, ?, ?)",
@@ -724,29 +809,21 @@ def body_markup(
     from markupsafe import escape
 
     spans = load_spans(conn, release.id)
-    entries = load_source_entries(conn, {s.source_set_id for s in spans})
-    box_ids = {e.box_id for items in entries.values() for e in items}
-    box_names: dict[int, tuple[int, int]] = {}
-    if box_ids:
-        placeholders = ",".join("?" for _ in box_ids)
-        for row in conn.execute(
-            f"SELECT id, page_no, box_no FROM box WHERE id IN ({placeholders})",
-            sorted(box_ids),
-        ):
-            box_names[row["id"]] = (row["page_no"], row["box_no"])
+    # Hover text needs at most a bounded preview per set, not every entry.
+    # This single query binds two parameters and caps rows inside SQLite.
+    previews = load_source_previews(conn, release.id, PREVIEW_SOURCE_LIMIT)
 
     parts: list[str] = []
     for span in spans:
         segment = release.body[span.start : span.end]
-        span_entries = entries.get(span.source_set_id, ())
-        title_bits = []
-        for entry in span_entries[:8]:
-            page_no, box_no = box_names[entry.box_id]
-            title_bits.append(
-                f"页{page_no} 框{box_no} [{entry.box_start},{entry.box_end})"
-            )
+        span_entries = previews.get(span.source_set_id, ())
+        title_bits = [
+            f"页{entry.page_no} 框{entry.box_no} "
+            f"[{entry.box_start},{entry.box_end})"
+            for entry in span_entries[:PREVIEW_SOURCE_TITLES]
+        ]
         title = "；".join(title_bits)
-        if len(span_entries) > 8:
+        if len(span_entries) > PREVIEW_SOURCE_TITLES:
             title += "；…"
         pieces: list[tuple[str, bool]] = [(segment, False)]
         if highlight and highlight[1] > span.start and highlight[0] < span.end:

@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from ocr_archive import archive
 from ocr_archive.app import create_app
@@ -15,6 +17,30 @@ BOXES = [
     {"page_no": 1, "box_no": 2, "rect": [10, 60, 100, 30], "text": "戊己庚辛"},
     {"page_no": 2, "box_no": 1, "rect": [10, 20, 120, 40], "text": "壬癸"},
 ]
+
+
+def many_boxes(count: int) -> list[dict]:
+    """One single-character box per source set, so a release references count sets."""
+    return [
+        {
+            "page_no": 1 + i // 50,
+            "box_no": 1 + i % 50,
+            "rect": [10, 20, 40, 20],
+            "text": chr(0x4E00 + i),
+        }
+        for i in range(count)
+    ]
+
+
+def connect_with_low_limit(path: str, limit: int) -> sqlite3.Connection:
+    """Open the archive like a SQLite build whose per-statement limit is tiny.
+
+    This is how an otherwise valid old library fails on a platform with a 999
+    (or lower) SQLITE_LIMIT_VARIABLE_NUMBER.
+    """
+    conn = archive.connect(path)
+    conn.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, limit)
+    return conn
 
 
 class ArchiveTestBase(unittest.TestCase):
@@ -254,6 +280,52 @@ class ReviseTest(ArchiveTestBase):
             self.conn.execute("SELECT COUNT(*) AS n FROM body_span").fetchone()["n"],
             span_count,
         )
+
+    def test_failed_release_write_keeps_current_and_history_intact(self):
+        """A failure between body and provenance writes leaves no partial release."""
+        r2 = self.revise(0, 1, "A")
+        current = archive.get_manuscript(self.conn, "JP-1").current_release_id
+        release_count = self.conn.execute(
+            "SELECT COUNT(*) AS n FROM release WHERE manuscript_id = ?",
+            (self.mid,),
+        ).fetchone()["n"]
+        span_count = self.conn.execute(
+            "SELECT COUNT(*) AS n FROM body_span"
+        ).fetchone()["n"]
+
+        # Fail the provenance insert after the release row has been written,
+        # so this exercises rollback in the middle of publishing a version.
+        self.conn.execute(
+            "CREATE TRIGGER fail_span BEFORE INSERT ON body_span "
+            "BEGIN SELECT RAISE(ABORT, 'provenance write failed'); END"
+        )
+        try:
+            with self.assertRaises(sqlite3.IntegrityError):
+                with self.app.app_context():
+                    ms = archive.get_manuscript(self.conn, "JP-1")
+                    archive.revise(self.conn, ms, r2.id, 0, 1, "B", "会失败")
+        finally:
+            self.conn.execute("DROP TRIGGER fail_span")
+
+        # The whole transaction rolled back: current pointer, releases and
+        # provenance are exactly as before, and the old release still reads.
+        self.assertEqual(
+            archive.get_manuscript(self.conn, "JP-1").current_release_id, current
+        )
+        self.assertEqual(
+            self.conn.execute(
+                "SELECT COUNT(*) AS n FROM release WHERE manuscript_id = ?",
+                (self.mid,),
+            ).fetchone()["n"],
+            release_count,
+        )
+        self.assertEqual(
+            self.conn.execute("SELECT COUNT(*) AS n FROM body_span").fetchone()["n"],
+            span_count,
+        )
+        old = archive.get_release(self.conn, self.mid, 1)
+        self.assertEqual(old.body, "甲乙丙丁戊己庚辛壬癸")
+        self.assertEqual(self.lookup(old, 0, 1)[0]["box_no"], 1)
 
     def test_old_release_read_does_not_need_replay(self):
         r2 = self.revise(0, 1, "ZZ")
@@ -526,6 +598,241 @@ class SchemaTest(ArchiveTestBase):
         }
         # Boxes 1..3 exist; no per-release copy of unchanged provenance.
         self.assertLessEqual(len(sets), 4)
+
+
+class ParameterLimitTest(unittest.TestCase):
+    """A big manuscript must open and be revised on a low-parameter-limit build."""
+
+    # Far below the 999 minimum SQLite usually reports, and far below the 300
+    # source sets / spans the fixture below puts in one release.
+    LIMIT = 25
+    BOX_COUNT = 300
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.db_path = str(Path(self.tmp.name) / "big.sqlite3")
+        archive.init_db(self.db_path)
+        self.conn = connect_with_low_limit(self.db_path, self.LIMIT)
+        boxes = archive.parse_boxes(many_boxes(self.BOX_COUNT))
+        self.mid = archive.ingest(self.conn, "BIG-1", "大稿", boxes)
+        self.ms = archive.get_manuscript(self.conn, "BIG-1")
+        self.r1 = archive.get_release(self.conn, self.mid, 1)
+
+    def tearDown(self) -> None:
+        self.conn.close()
+        self.tmp.cleanup()
+
+    def test_low_limit_is_actually_enforced(self):
+        self.assertEqual(
+            self.conn.getlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER), self.LIMIT
+        )
+        placeholders = ",".join("?" for _ in range(self.LIMIT + 1))
+        with self.assertRaises(sqlite3.OperationalError):
+            self.conn.execute(f"SELECT 1 WHERE ? IN ({placeholders})", list(range(self.LIMIT + 1)))
+
+    def test_page_markup_opens_with_many_source_sets(self):
+        html = archive.body_markup(self.conn, self.r1)
+        self.assertEqual(html.count('class="prov"'), self.BOX_COUNT)
+        self.assertIn(self.r1.body[0], html)
+
+    def test_page_markup_bounds_hover_to_eight_plus_ellipsis(self):
+        union = self._union_release()
+        html = archive.body_markup(self.conn, union)
+        title = html.split('title="', 1)[1].split('"', 1)[0]
+        self.assertEqual(title.count("页"), archive.PREVIEW_SOURCE_TITLES)
+        self.assertTrue(title.endswith("；…"))
+
+    def test_revise_whole_large_body_succeeds_and_keeps_old_release(self):
+        r2 = archive.revise(
+            self.conn, self.ms, self.r1.id, 0, len(self.r1.body), "替", "整版替换"
+        )
+        self.assertEqual(r2.body, "替")
+        self.assertEqual(self.ms.current_release_id, self.r1.id)
+        old = archive.get_release(self.conn, self.mid, 1)
+        self.assertEqual(old.body, self.r1.body)
+        self.assertEqual(len(archive.lookup_sources(self.conn, old, 0, 1)), 1)
+
+    def _union_release(self) -> archive.Release:
+        """One span whose source set holds one entry per selected box."""
+        return archive.revise(
+            self.conn, self.ms, self.r1.id, 0, len(self.r1.body), "Q", ""
+        )
+
+    def test_web_page_opens_and_revise_and_lookup_work_on_low_limit(self):
+        """Old library + small SQLite limit: the browser flow must still work.
+
+        The app's own per-request connection is opened with the same low
+        SQLITE_LIMIT_VARIABLE_NUMBER, so this exercises the real HTTP handlers.
+        """
+        real_connect = archive.connect
+
+        def low_limit_connect(path: str) -> sqlite3.Connection:
+            conn = real_connect(path)
+            conn.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, self.LIMIT)
+            return conn
+
+        app = create_app({"TESTING": True, "DATABASE": self.db_path})
+        client = app.test_client()
+        with mock.patch.object(archive, "connect", low_limit_connect):
+            page = client.get("/m/BIG-1")
+            self.assertEqual(page.status_code, 200)
+            html = page.get_data(as_text=True)
+            self.assertIn(f'data-release-id="{self.r1.id}"', html)
+
+            resp = client.post(
+                "/m/BIG-1/revise",
+                data={
+                    "base_release_id": self.r1.id,
+                    "start": 0,
+                    "end": self.BOX_COUNT,
+                    "replacement": "整",
+                    "note": "整版替换",
+                },
+            )
+            self.assertEqual(resp.status_code, 302)
+            page = client.get(resp.headers["Location"])
+            self.assertEqual(page.status_code, 200)
+            self.assertIn("整", page.get_data(as_text=True))
+
+            # Full-detail lookup of the inserted character lists every box.
+            resp = client.get("/api/m/BIG-1/lookup?start=0&end=1")
+            payload = resp.get_json()
+            self.assertEqual(resp.status_code, 200)
+            self.assertEqual(len(payload["sources"]), self.BOX_COUNT)
+            self.assertFalse(payload["sources"][0]["exact"])
+
+            # Every historical release still renders exactly as it was.
+            old = client.get("/m/BIG-1?release=1")
+            self.assertEqual(old.status_code, 200)
+            self.assertIn("历史版", old.get_data(as_text=True))
+
+    def test_large_span_selection_with_many_boxes_inherits_full_union(self):
+        # The new single-character run inherits all 300 box intervals.
+        r2 = self._union_release()
+        self.assertEqual(r2.body, "Q")
+        set_row = self.conn.execute(
+            "SELECT source_set_id FROM body_span WHERE release_id = ?",
+            (r2.id,),
+        ).fetchone()
+        entry_count = self.conn.execute(
+            "SELECT COUNT(*) AS n FROM source_entry WHERE source_set_id = ?",
+            (set_row["source_set_id"],),
+        ).fetchone()["n"]
+        self.assertEqual(entry_count, self.BOX_COUNT)
+
+        # Full-detail lookup still returns every contributing box.
+        sources = archive.lookup_sources(self.conn, r2, 0, 1)
+        self.assertEqual(len(sources), self.BOX_COUNT)
+        self.assertFalse(sources[0]["exact"])
+
+        # Re-editing the inserted character reuses the whole inherited union.
+        ms = archive.get_manuscript(self.conn, "BIG-1")
+        r3 = archive.revise(self.conn, ms, r2.id, 0, 1, "Y", "")
+        again = archive.lookup_sources(self.conn, r3, 0, 1)
+        self.assertEqual(len(again), self.BOX_COUNT)
+
+    def test_hover_on_shared_union_shows_first_eight_then_ellipsis(self):
+        r2 = self._union_release()
+        html = archive.body_markup(self.conn, r2)
+        title = html.split('title="', 1)[1].split('"', 1)[0]
+        self.assertEqual(title.count("页"), archive.PREVIEW_SOURCE_TITLES)
+        self.assertTrue(title.endswith("；…"))
+        # In stored order (box id / interval), i.e. the original reading order.
+        self.assertIn("页1 框1 [0,1)", title)
+        self.assertIn("页1 框8 [0,1)", title)
+        self.assertNotIn("框9 ", title)
+
+    def test_preview_fetches_at_most_nine_rows_per_set(self):
+        r2 = self._union_release()
+        previews = archive.load_source_previews(self.conn, r2.id)
+        self.assertEqual(
+            [len(v) for v in previews.values()], [archive.PREVIEW_SOURCE_LIMIT]
+        )
+
+    def test_preview_query_count_does_not_grow_with_spans_or_sets(self):
+        def count_queries(release_id: int) -> int:
+            seen: list[str] = []
+
+            def tracer(statement: str) -> None:
+                if statement.lstrip().upper().startswith("SELECT"):
+                    seen.append(statement)
+
+            self.conn.set_trace_callback(tracer)
+            try:
+                archive.body_markup(
+                    self.conn, archive.get_release_by_id(self.conn, release_id)
+                )
+            finally:
+                self.conn.set_trace_callback(None)
+            return len(seen)
+
+        mid = archive.ingest(
+            self.conn, "SMALL-1", "小稿", archive.parse_boxes(many_boxes(3))
+        )
+        small_release = archive.get_release(self.conn, mid, 1)
+        union = self._union_release()
+        counts = {
+            "3 spans/3 sets": count_queries(small_release.id),
+            "1 span/1 huge set": count_queries(union.id),
+            "300 spans/300 sets": count_queries(self.r1.id),
+        }
+        self.assertEqual(
+            len(set(counts.values())), 1,
+            f"body rendering must issue a constant number of queries: {counts}",
+        )
+
+
+class PreviewHttpTest(ArchiveTestBase):
+    @staticmethod
+    def _titles(html: str) -> list[str]:
+        return re.findall(r'title="([^"]*)"', html)
+
+    def test_hover_shows_all_entries_when_at_most_eight_no_ellipsis(self):
+        boxes = archive.parse_boxes(many_boxes(8))
+        with self.app.app_context():
+            mid = archive.ingest(self.conn, "HOVER-8", "悬停八", boxes)
+            release = archive.get_release(self.conn, mid, 1)
+            html = archive.body_markup(self.conn, release)
+        # Eight one-character spans, each with its own single-box source.
+        self.assertEqual(len(self._titles(html)), 8)
+        joined = "".join(self._titles(html))
+        self.assertIn("页1 框1 [0,1)", joined)
+        self.assertIn("页1 框8 [0,1)", joined)
+        self.assertNotIn("…", joined)
+
+    def test_hover_on_nine_entries_shows_eight_then_ellipsis(self):
+        boxes = archive.parse_boxes(many_boxes(9))
+        with self.app.app_context():
+            mid = archive.ingest(self.conn, "HOVER-9", "悬停九", boxes)
+            release = archive.get_release(self.conn, mid, 1)
+            archive.revise(
+                self.conn, archive.get_manuscript(self.conn, "HOVER-9"),
+                release.id, 0, len(release.body), "Z", "",
+            )
+            union = archive.get_release(self.conn, mid, 2)
+            title = self._titles(archive.body_markup(self.conn, union))[0]
+        self.assertEqual(title.count("页"), 8)
+        self.assertTrue(title.endswith("；…"))
+
+    def test_history_page_is_read_only_and_keeps_original_text(self):
+        boxes = archive.parse_boxes(many_boxes(12))
+        with self.app.app_context():
+            mid = archive.ingest(self.conn, "HIST-1", "历史", boxes)
+            r1 = archive.get_release(self.conn, mid, 1)
+            ms = archive.get_manuscript(self.conn, "HIST-1")
+            archive.revise(self.conn, ms, r1.id, 0, 1, "改", "")
+        resp = self.client.get("/m/HIST-1?release=1")
+        html = resp.get_data(as_text=True)
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn("历史版", html)
+        self.assertNotIn('name="base_release_id"', html)
+        self.assertIn(r1.body[:12], html)
+
+    def test_fewer_than_nine_entries_has_no_ellipsis(self):
+        html = archive.body_markup(self.conn, self.r1)
+        title = self._titles(html)[0]
+        self.assertEqual(title.count("页"), 1)
+        self.assertNotIn("…", title)
 
 
 if __name__ == "__main__":
